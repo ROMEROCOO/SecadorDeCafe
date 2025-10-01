@@ -1,0 +1,36 @@
+1
+Lectura de sensor DHT11 y promedio correcto
+
+Acción: Dejar corriendo el ESP32 en condiciones normales.
+
+Esperado: Cada 10 s debe registrar temperatura y humedad promedio, enviarlas por serial en el formato $YYYY-MM-DD HH:MM:SS,T,H,estado. En OLED también deben aparecer los valores.
+------------------------------------
+2
+Ciclo Peltier/Fan (20 s ON / 20 s OFF)
+
+Acción: Observar LED/buzzer y medir con multímetro o verificar por serial.
+
+Esperado: Peltier y ventilador deben encender 20 s y luego apagarse 20 s en ciclo indefinido. En serial debe aparecer el log [PeltierTimer] Cambiando estado -> ON/OFF.
+--------------------------------
+3
+Gestión de energía (light sleep)
+
+Acción: Conectar ESP32 a un medidor de corriente (o revisar logs seriales).
+
+Esperado: Cada vez que termina de leer el DHT, debe aparecer [TaskSensor] Entrando en light sleep por 10s... y después [TaskSensor] Despertó del light sleep.. El consumo baja en esos intervalos.
+
+---------------------------------------
+4
+Interrupción de emergencia (ISR)
+
+Acción: Pulsar/emular el botón en el pin 27 (emergencia).
+
+Esperado: Se enciende buzzer y LED brevemente, el sistema apaga Peltier y fan, y en serial aparece: [TaskControl] EMERGENCIA! Semaforo recibido desde ISR..
+
+-----------------------------------------
+5
+Sincronización de RTC con WiFi/NTP
+
+Acción: Encender ESP32 con WiFi disponible.
+
+Esperado: En setup debe mostrar WiFi conectado. y Sincronizando RTC con NTP.. Luego de desconectar WiFi, el RTC sigue entregando la hora correcta.
