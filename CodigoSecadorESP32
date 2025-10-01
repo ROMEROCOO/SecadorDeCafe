@@ -1,0 +1,578 @@
+/*
+ * @file main.cpp
+ * @brief Secador de café - Versión con light sleep + Peltier/Fan 20s ON / 20s OFF + Requerimientos adicionales
+ * 
+ * Este programa controla un secador de café utilizando ESP32 con FreeRTOS. Incluye lecturas de sensor DHT11,
+ * control de Peltier y ventilador en ciclos fijos, manejo de emergencias via ISR, gestión de potencia con light sleep,
+ * formateo de datos para envío serial con timestamp, manejo de errores en la trama, integración de RTC DS3231 para tiempo preciso,
+ * alarmas visuales (LED) y sonoras (buzzer), y opcionalmente despliegue en OLED.
+ * 
+ * @author [Tu Nombre o Grok]
+ * @date Octubre 2025
+ * 
+ * @note Compilado para ESP32 v3 en Arduino IDE.
+ * @note Librerías requeridas: DHT, WiFi, time, esp_sleep, RTClib, Adafruit_SSD1306, Adafruit_GFX, FreeRTOS.
+ * @note Pines:
+ *   - DHT: 4
+ *   - Emergency: 27
+ *   - Peltier: 26
+ *   - Fan: 25
+ *   - Buzzer: 33 (alarma sonora)
+ *   - LED: 32 (alarma visual)
+ *   - RTC DS3231: I2C (SDA=21, SCL=22)
+ *   - OLED: I2C (SDA=21, SCL=22, address 0x3C)
+ */
+
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/timers.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include "time.h"
+#include <esp_sleep.h>
+#include <RTClib.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+
+// ---------------- CONFIG ----------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define DHT_READ_INTERVAL_S 10UL     ///< Leer cada 10 segundos
+#define SEND_INTERVAL_S 10UL         ///< Envío cada 10 s
+#define QUEUE_LEN 10
+#define SERIAL_MUTEX_WAIT_MS 200
+
+// WiFi / NTP (solo para inicializar RTC si es necesario)
+const char* WIFI_SSID = "JHOSS";
+const char* WIFI_PASS = "07042004robert0#";
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = -18000; ///< Colombia UTC-5
+const int DST_OFFSET_SEC = 0;
+
+// Emergency (ISR) pin
+#define EMERGENCY_PIN 27
+
+// Peltier & Fan pins
+#define PELTIER_PIN 26
+#define FAN_PIN 25
+bool peltierOn = false;   ///< Estado del Peltier (controlado por timer)
+bool fanOn = false;       ///< Estado del ventilador (sincronizado con Peltier)
+
+// Peltier cycle (ms)
+#define PELTIER_ON_MS 20000UL   ///< 20 s ON
+#define PELTIER_OFF_MS 20000UL  ///< 20 s OFF
+
+// Alarmas
+#define BUZZER_PIN 33  ///< Pin para buzzer (alarma sonora)
+#define LED_PIN 32     ///< Pin para LED (alarma visual)
+#define ALARM_DURATION_MS 500  ///< Duración de la alarma sonora
+
+// Opcional: OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+// ----------------------------------------
+
+DHT dht(DHTPIN, DHTTYPE);
+RTC_DS3231 rtc;  ///< Instancia del RTC DS3231
+bool rtcAvailable = false;  ///< Bandera para indicar si RTC está disponible
+
+// Opcional: OLED
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- FreeRTOS objects ----------
+static QueueHandle_t sensorQueue = NULL;
+static SemaphoreHandle_t aggMutex = NULL;
+static SemaphoreHandle_t serialMutex = NULL;
+static SemaphoreHandle_t sampleCountSem = NULL;
+static SemaphoreHandle_t emergencySem = NULL;
+static TimerHandle_t sendTimer = NULL;
+static TimerHandle_t peltierTimer = NULL;
+
+TaskHandle_t TaskSenderHandle = NULL;
+TaskHandle_t TaskProcessorHandle = NULL;
+TaskHandle_t TaskControlHandle = NULL;
+TaskHandle_t TaskSensorHandle = NULL;
+
+// ---------- Tipos ----------
+/**
+ * @struct SensorReading
+ * @brief Estructura para lecturas del sensor DHT.
+ */
+typedef struct {
+  float temperature;  ///< Temperatura leída
+  float humidity;     ///< Humedad leída
+  uint32_t timestamp_ms;  ///< Timestamp en ms
+  bool valid;         ///< Validez de la lectura
+} SensorReading;
+
+/**
+ * @struct AggData
+ * @brief Estructura para datos agregados.
+ */
+typedef struct {
+  double sumTemp;     ///< Suma de temperaturas
+  double sumHum;      ///< Suma de humedades
+  uint32_t count;     ///< Conteo de lecturas válidas
+  bool anyError;      ///< Indicador de error en lecturas
+  bool emergencyFlag; ///< Bandera de emergencia
+} AggData;
+
+static AggData agg = {0.0, 0.0, 0, false, false};
+
+// ---------- Protos ----------
+/**
+ * @brief Tarea para leer el sensor DHT y usar light sleep.
+ * @param pvParameters Parámetros (no usados).
+ */
+void TaskSensor(void *pvParameters);
+
+/**
+ * @brief Tarea para procesar lecturas del sensor.
+ * @param pvParameters Parámetros (no usados).
+ */
+void TaskProcessor(void *pvParameters);
+
+/**
+ * @brief Tarea para enviar datos por serial.
+ * @param pvParameters Parámetros (no usados).
+ */
+void TaskSender(void *pvParameters);
+
+/**
+ * @brief Tarea para control de emergencias.
+ * @param pvParameters Parámetros (no usados).
+ */
+void TaskControl(void *pvParameters);
+
+/**
+ * @brief Tarea para manejar el estado del Peltier (logs y actualizaciones).
+ * @param pvParameters Parámetros (no usados).
+ */
+void TaskPeltier(void *pvParameters);
+
+/**
+ * @brief ISR para emergencia.
+ */
+void IRAM_ATTR emergencyISR();
+
+/**
+ * @brief Callback del timer de envío.
+ * @param xTimer Timer handle.
+ */
+void vSendTimerCallback(TimerHandle_t xTimer);
+
+/**
+ * @brief Callback del timer del Peltier.
+ * @param xTimer Timer handle.
+ */
+void vPeltierTimerCallback(TimerHandle_t xTimer);
+
+/**
+ * @brief Obtiene timestamp formateado usando RTC o millis si RTC no está disponible.
+ * @return String con timestamp YYYY-MM-DD HH:MM:SS.
+ */
+String getTimestamp();
+
+/**
+ * @brief Activa alarmas visuales y sonoras.
+ */
+void activateAlarms();
+
+// ---------- Setup ----------
+/**
+ * @brief Función de setup inicial.
+ */
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Secador: Light Sleep + Peltier ciclo 20s ON/20s OFF + RTC + Alarmas ===");
+
+  // Inicializar pines de alarmas
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  // Inicializar RTC DS3231
+  Wire.begin();  // Iniciar I2C
+  if (!rtc.begin()) {
+    Serial.println("WARNING: No se encontró RTC DS3231. Usando timestamp basado en millis.");
+    rtcAvailable = false;
+  } else {
+    rtcAvailable = true;
+    if (rtc.lostPower()) {
+      Serial.println("RTC perdió potencia, configurando hora inicial.");
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+  }
+
+  // WiFi + NTP (opcional: sincronizar RTC con NTP si WiFi disponible)
+  Serial.printf("Conectando a WiFi %s ...", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado.");
+    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000) && rtcAvailable) {
+      Serial.println("Sincronizando RTC con NTP.");
+      rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+    } else {
+      Serial.println("Fallo al sincronizar NTP, usando RTC o millis.");
+    }
+  } else {
+    Serial.println("\nAtención: no conectado a WiFi, usando RTC o millis para tiempo.");
+  }
+  // Apagamos WiFi para ahorrar energía
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Opcional: Inicializar OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println(F("OLED no encontrado, continuando sin display."));
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("Secador Cafe Init"));
+    display.display();
+  }
+
+  // Inicializar DHT
+  dht.begin();
+
+  // Inicializar Peltier y ventilador
+  pinMode(PELTIER_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(PELTIER_PIN, LOW);
+  digitalWrite(FAN_PIN, LOW);
+  peltierOn = false;
+  fanOn = false;
+
+  // Crear recursos FreeRTOS
+  sensorQueue = xQueueCreate(QUEUE_LEN, sizeof(SensorReading));
+  aggMutex = xSemaphoreCreateMutex();
+  serialMutex = xSemaphoreCreateMutex();
+  sampleCountSem = xSemaphoreCreateCounting(1000, 0);
+  emergencySem = xSemaphoreCreateBinary();
+
+  if (!sensorQueue || !aggMutex || !serialMutex || !sampleCountSem || !emergencySem) {
+    Serial.println("ERROR: No se pudieron crear recursos FreeRTOS.");
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  // Crear timer de envío
+  sendTimer = xTimerCreate("SendTimer",
+                           pdMS_TO_TICKS(SEND_INTERVAL_S * 1000UL),
+                           pdTRUE,
+                           (void*)0,
+                           vSendTimerCallback);
+  if (!sendTimer) {
+    Serial.println("ERROR: No se pudo crear sendTimer.");
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  // Crear timer para Peltier
+  peltierTimer = xTimerCreate("PeltierTimer",
+                              pdMS_TO_TICKS(PELTIER_ON_MS),
+                              pdFALSE,
+                              (void*)0,
+                              vPeltierTimerCallback);
+  if (!peltierTimer) {
+    Serial.println("ERROR: No se pudo crear peltierTimer.");
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  // Crear tareas
+  BaseType_t r = pdPASS;
+  r = xTaskCreatePinnedToCore(TaskSensor, "TaskSensor", 4096, NULL, 2, &TaskSensorHandle, 1);
+  r |= xTaskCreatePinnedToCore(TaskProcessor, "TaskProcessor", 4096, NULL, 2, &TaskProcessorHandle, 1);
+  r |= xTaskCreatePinnedToCore(TaskSender, "TaskSender", 4096, NULL, 2, &TaskSenderHandle, 1);
+  r |= xTaskCreatePinnedToCore(TaskControl, "TaskControl", 4096, NULL, 3, &TaskControlHandle, 1);
+  r |= xTaskCreatePinnedToCore(TaskPeltier, "TaskPeltier", 4096, NULL, 3, NULL, 1);
+
+  if (r != pdPASS) {
+    Serial.println("ERROR creando tareas.");
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  if (xTimerStart(sendTimer, 0) != pdPASS) {
+    Serial.println("ERROR: No se pudo iniciar sendTimer.");
+  }
+
+  // Iniciar ciclo Peltier: ON inicialmente
+  peltierOn = true;
+  fanOn = true;
+  digitalWrite(PELTIER_PIN, HIGH);
+  digitalWrite(FAN_PIN, HIGH);
+  if (xTimerStart(peltierTimer, 0) != pdPASS) {
+    Serial.println("ERROR: No se pudo iniciar peltierTimer.");
+  }
+
+  // Configurar ISR emergencia
+  pinMode(EMERGENCY_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(EMERGENCY_PIN), emergencyISR, FALLING);
+
+  Serial.println("Setup completo.");
+}
+
+// ---------- Loop vacío ----------
+/**
+ * @brief Loop principal (vacío, ya que usamos RTOS).
+ */
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+// ---------- TaskSensor ----------
+void TaskSensor(void *pvParameters) {
+  (void)pvParameters;
+  SensorReading r;
+
+  // Tiempo para light sleep (gestión de potencia: modo light sleep entre lecturas)
+  const uint64_t sleep_us = (uint64_t)DHT_READ_INTERVAL_S * 1000000ULL;
+
+  for (;;) {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    r.timestamp_ms = millis();
+    if (isnan(h) || isnan(t)) {
+      r.valid = false;
+      r.humidity = 0.0f;
+      r.temperature = 0.0f;
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+        Serial.println("[Sensor] Lectura INVÁLIDA");
+        xSemaphoreGive(serialMutex);
+      }
+    } else {
+      r.valid = true;
+      r.humidity = h;
+      r.temperature = t;
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+        Serial.printf("[Sensor] T=%.2f C  H=%.2f %%\n", t, h);
+        xSemaphoreGive(serialMutex);
+      }
+    }
+
+    if (xQueueSend(sensorQueue, &r, pdMS_TO_TICKS(100)) != pdTRUE) {
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+        Serial.println("[TaskSensor] WARNING: cola llena, lectura descartada");
+        xSemaphoreGive(serialMutex);
+      }
+    } else {
+      xSemaphoreGive(sampleCountSem);
+    }
+
+    // Gestión de potencia: light sleep
+    esp_sleep_enable_timer_wakeup(sleep_us);
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+      Serial.printf("[TaskSensor] Entrando en light sleep por %lus...\n", (unsigned long)DHT_READ_INTERVAL_S);
+      xSemaphoreGive(serialMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_light_sleep_start();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+      Serial.println("[TaskSensor] Despertó del light sleep.");
+      xSemaphoreGive(serialMutex);
+    }
+  }
+}
+
+// ---------- TaskProcessor ----------
+void TaskProcessor(void *pvParameters) {
+  (void)pvParameters;
+  SensorReading rcv;
+  for (;;) {
+    if (xQueueReceive(sensorQueue, &rcv, portMAX_DELAY) == pdTRUE) {
+      if (xSemaphoreTake(aggMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (rcv.valid) {
+          agg.sumTemp += rcv.temperature;
+          agg.sumHum  += rcv.humidity;
+          agg.count++;
+        } else {
+          agg.anyError = true;
+        }
+        xSemaphoreGive(aggMutex);
+      }
+    }
+  }
+}
+
+// ---------- TaskPeltier ----------
+void TaskPeltier(void *pvParameters) {
+  (void)pvParameters;
+  bool lastState = peltierOn;
+  for (;;) {
+    if (lastState != peltierOn) {
+      lastState = peltierOn;
+      digitalWrite(PELTIER_PIN, lastState ? HIGH : LOW);
+      digitalWrite(FAN_PIN, lastState ? HIGH : LOW);
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+        Serial.printf("[TaskPeltier] Estado cambiado: Peltier=%s Fan=%s\n",
+                      lastState ? "ON" : "OFF",
+                      lastState ? "ON" : "OFF");
+        xSemaphoreGive(serialMutex);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ---------- vPeltierTimerCallback ----------
+void vPeltierTimerCallback(TimerHandle_t xTimer) {
+  (void)xTimer;
+  peltierOn = !peltierOn;
+  fanOn = peltierOn;
+  TickType_t nextPeriodTicks = peltierOn ? pdMS_TO_TICKS(PELTIER_ON_MS) : pdMS_TO_TICKS(PELTIER_OFF_MS);
+  xTimerChangePeriod(peltierTimer, nextPeriodTicks, 0);
+  if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+    Serial.printf("[PeltierTimer] Cambiando estado -> %s. Próximo periodo %lu ms\n", peltierOn ? "ON" : "OFF",
+                  (unsigned long)(nextPeriodTicks * portTICK_PERIOD_MS));
+    xSemaphoreGive(serialMutex);
+  }
+}
+
+// ---------- vSendTimerCallback ----------
+void vSendTimerCallback(TimerHandle_t xTimer) {
+  (void)xTimer;
+  if (TaskSenderHandle != NULL) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(TaskSenderHandle, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+  }
+}
+
+// ---------- TaskSender ----------
+void TaskSender(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    double sumT = 0.0, sumH = 0.0;
+    uint32_t cnt = 0;
+    bool anyErr = false;
+    bool emerg = false;
+
+    if (xSemaphoreTake(aggMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      sumT = agg.sumTemp;
+      sumH = agg.sumHum;
+      cnt  = agg.count;
+      anyErr = agg.anyError;
+      emerg = agg.emergencyFlag;
+
+      // Reset agregados
+      agg.sumTemp = 0.0;
+      agg.sumHum  = 0.0;
+      agg.count = 0;
+      agg.anyError = false;
+      agg.emergencyFlag = false;
+
+      xSemaphoreGive(aggMutex);
+    } else {
+      anyErr = true;
+    }
+
+    float avgT = 0.0f, avgH = 0.0f;
+    int estado = 1;  // 1: OK, 0: Error general, -1: Emergencia, -2: Sin lecturas
+    if (cnt > 0) {
+      avgT = (float)(sumT / (double)cnt);
+      avgH = (float)(sumH / (double)cnt);
+      if (anyErr) estado = 0;
+      if (emerg) estado = -1;
+    } else {
+      estado = -2;  // Manejo de errores: sin lecturas válidas
+    }
+
+    String ts = getTimestamp();
+
+    // Formateo con manejo de errores en trama
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+      Serial.printf("$%s,%.2f,%.2f,%d\n", ts.c_str(), avgT, avgH, estado);
+      xSemaphoreGive(serialMutex);
+    }
+
+    // Opcional: Actualizar OLED
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.printf("TS: %s\nT: %.2f C\nH: %.2f %%\nEstado: %d", ts.c_str(), avgT, avgH, estado);
+    display.display();
+  }
+}
+
+// ---------- TaskControl ----------
+void TaskControl(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    if (xSemaphoreTake(emergencySem, portMAX_DELAY) == pdTRUE) {
+      if (xSemaphoreTake(aggMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        agg.emergencyFlag = true;
+        agg.anyError = true;
+        xSemaphoreGive(aggMutex);
+      }
+      // Notificar envío inmediato
+      if (TaskSenderHandle != NULL) {
+        xTaskNotifyGive(TaskSenderHandle);
+      }
+      // Activar alarmas
+      activateAlarms();
+      // Apagar Peltier y fan por seguridad
+      peltierOn = false;
+      fanOn = false;
+      digitalWrite(PELTIER_PIN, LOW);
+      digitalWrite(FAN_PIN, LOW);
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(SERIAL_MUTEX_WAIT_MS)) == pdTRUE) {
+        Serial.println("[TaskControl] EMERGENCIA! Semaforo recibido desde ISR.");
+        xSemaphoreGive(serialMutex);
+      }
+    }
+  }
+}
+
+// ---------- emergencyISR ----------
+void IRAM_ATTR emergencyISR() {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(emergencySem, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+// ---------- getTimestamp ----------
+String getTimestamp() {
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    char out[25];
+    snprintf(out, sizeof(out), "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    return String(out);
+  } else {
+    // Fallback: timestamp basado en millis
+    uint32_t s = millis() / 1000UL;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "1970-01-01 %02u:%02u:%02u",
+             (unsigned)(s/3600)%24, (unsigned)(s/60)%60, (unsigned)(s%60));
+    return String(buf);
+  }
+}
+
+// ---------- activateAlarms ----------
+void activateAlarms() {
+  // Alarma visual: Encender LED
+  digitalWrite(LED_PIN, HIGH);
+  // Alarma sonora: Tono en buzzer
+  tone(BUZZER_PIN, 1000, ALARM_DURATION_MS);
+  // Apagar LED después de duración (no bloqueante)
+  vTaskDelay(pdMS_TO_TICKS(ALARM_DURATION_MS));
+  digitalWrite(LED_PIN, LOW);
+}
